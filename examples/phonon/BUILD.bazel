@@ -1,0 +1,117 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_zig//zig:defs.bzl", "zig_binary", "zig_test")
+
+cc_library(
+    name = "phonon_tokenizer_regex",
+    srcs = ["src/phonon/tokenizer_regex.c"],
+    hdrs = ["src/phonon/tokenizer_regex.h"],
+    deps = ["@pcre2"],
+)
+
+cc_library(
+    name = "audio",
+    srcs = ["src/audio.c"],
+    hdrs = ["src/audio.h"],
+    copts = ["-std=c11"],
+    linkopts = select({
+        "@platforms//os:linux": [
+            "-ldl",
+            "-lpthread",
+            "-lm",
+        ],
+        "@platforms//os:macos": [
+            "-framework",
+            "CoreFoundation",
+            "-framework",
+            "CoreAudio",
+            "-framework",
+            "AudioToolbox",
+        ],
+        "//conditions:default": [],
+    }),
+    deps = ["@miniaudio"],
+)
+
+zig_binary(
+    name = "phonon",
+    srcs = [
+        "src/Audio_Player.zig",
+        "src/mimi/convolution.zig",
+        "src/mimi/convolution_test_data.zig",
+        "src/mimi/model.zig",
+        "src/mimi/model_test_data.zig",
+        "src/mimi/root.zig",
+        "src/mimi/root_test_data.zig",
+        "src/mimi/seanet.zig",
+        "src/mimi/seanet_test_data.zig",
+        "src/mimi/transformer.zig",
+        "src/mimi/transformer_test_data.zig",
+        "src/phonon/Tokenizer.zig",
+        "src/phonon/eos_head.zig",
+        "src/phonon/flow_head.zig",
+        "src/phonon/model.zig",
+        "src/phonon/root.zig",
+        "src/phonon/transformer.zig",
+
+        # TODO: silly
+        "src/phonon/flow_head_test_data.zig",
+        "src/phonon/main_test_data.zig",
+        "src/phonon/model_test_data.zig",
+        "src/phonon/transformer_test_data.zig",
+        "src/util.zig",
+    ],
+    data = [
+        "@phonon_31m_en//:model.safetensors",
+        "@phonon_31m_en//:tokenizer.5.0.0.json",
+        "@phonon_mimi//:model.safetensors",
+        "@phonon_voices//:voices/Tek4tJXiX6_yvXq7.safetensors",
+    ],
+    main = "src/main.zig",
+    deps = [
+        ":audio",
+        ":phonon_tokenizer_regex",
+        "@zml//zml",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+zig_test(
+    name = "test",
+    srcs = [
+        "src/Audio_Player.zig",
+        "src/mimi/convolution.zig",
+        "src/mimi/convolution_test_data.zig",
+        "src/mimi/model.zig",
+        "src/mimi/model_test_data.zig",
+        "src/mimi/root.zig",
+        "src/mimi/root_test_data.zig",
+        "src/mimi/seanet.zig",
+        "src/mimi/seanet_test_data.zig",
+        "src/mimi/transformer.zig",
+        "src/mimi/transformer_test_data.zig",
+        "src/phonon/Tokenizer.zig",
+        "src/phonon/eos_head.zig",
+        "src/phonon/flow_head.zig",
+        "src/phonon/flow_head_test_data.zig",
+        "src/phonon/main_test_data.zig",
+        "src/phonon/model.zig",
+        "src/phonon/model_test_data.zig",
+        "src/phonon/root.zig",
+        "src/phonon/transformer.zig",
+        "src/phonon/transformer_test_data.zig",
+        "src/util.zig",
+    ],
+    data = [
+        "@phonon_31m_en//:model.safetensors",
+        "@phonon_31m_en//:tokenizer.5.0.0.json",
+        "@phonon_mimi//:model.safetensors",
+        "@phonon_voices//:voices/Tek4tJXiX6_yvXq7.safetensors",
+    ],
+    main = "src/main.zig",
+    deps = [
+        ":audio",
+        ":phonon_tokenizer_regex",
+        "@zml//zml",
+    ],
+    visibility = ["//visibility:public"],
+)

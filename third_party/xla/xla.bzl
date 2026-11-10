@@ -1,13 +1,24 @@
 load("@xla//third_party:repo.bzl", "tf_http_archive", "tf_mirror_urls", "tf_vendored")
+load("@xla//third_party/brotli:workspace.bzl", brotli = "repo")
+load("@xla//third_party/cpuinfo:workspace.bzl", cpuinfo = "repo")
+load("@xla//third_party/ducc:workspace.bzl", ducc = "repo")
 load("@xla//third_party/eigen3:workspace.bzl", eigen3 = "repo")
 load("@xla//third_party/farmhash:workspace.bzl", farmhash = "repo")
+load("@xla//third_party/fxdiv:workspace.bzl", fxdiv = "repo")
 load("@xla//third_party/highwayhash:workspace.bzl", highwayhash = "repo")
 load("@xla//third_party/hwloc:workspace.bzl", hwloc = "repo")
+load("@xla//third_party/kleidiai:workspace.bzl", kleidiai = "repo")
 load("@xla//third_party/llvm:workspace.bzl", llvm = "repo")
+load("@xla//third_party/net_zstd:workspace.bzl", net_zstd = "repo")
+load("@xla//third_party/pthreadpool:workspace.bzl", pthreadpool = "repo")
 load("@xla//third_party/py/ml_dtypes:workspace.bzl", ml_dtypes = "repo")
+load("@xla//third_party/riegeli:workspace.bzl", riegeli = "repo")
 load("@xla//third_party/shardy:workspace.bzl", shardy = "repo")
+load("@xla//third_party/slinky:workspace.bzl", slinky = "repo")
+load("@xla//third_party/sqlite:workspace.bzl", sqlite = "repo")
 load("@xla//third_party/stablehlo:workspace.bzl", stablehlo = "repo")
 load("@xla//third_party/triton:workspace.bzl", triton = "repo")
+load("@xla//third_party/xnnpack:workspace.bzl", xnnpack = "repo")
 
 _BZL_HELPERS = """\
 always_newer_than = lambda wanted_ver, if_true, if_false = []: if_true
@@ -88,7 +99,12 @@ config_setting(
     define_values = {"local_config_rocm_using_hipcc": "true"},
 )
 """,
-        "rocm/build_defs.bzl": _BZL_HELPERS + """\
+        "rocm/build_defs.bzl": """\
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+""" + _BZL_HELPERS + """\
+rocm_library = cc_library
+rocm_version_number = lambda: 0
 if_rocm = always_if_false
 if_rocm_is_configured = always_if_false
 if_rocm_newer_than = always_newer_than
@@ -202,6 +218,17 @@ def _xla_impl(mctx):
     hwloc()
     eigen3()
     ml_dtypes()
+    riegeli()
+    slinky()
+    sqlite()
+    net_zstd()
+    brotli()
+    cpuinfo()
+    ducc()
+    fxdiv()
+    kleidiai()
+    pthreadpool()
+    xnnpack()
 
     tf_http_archive(
         name = "com_github_grpc_grpc",
@@ -218,6 +245,19 @@ def _xla_impl(mctx):
         sha256 = "90f74bc1fbf78a6c56b3c4a082a05103b3a56bb17bca1a27e052ea11723292dc",
         strip_prefix = "snappy-1.2.2",
         urls = tf_mirror_urls("https://github.com/google/snappy/archive/refs/tags/1.2.2.tar.gz"),
+    )
+    tf_http_archive(
+        name = "jsoncpp_git",
+        sha256 = "f409856e5920c18d0c2fb85276e24ee607d2a09b5e7d5f0a371368903c275da2",
+        strip_prefix = "jsoncpp-1.9.5",
+        urls = tf_mirror_urls("https://github.com/open-source-parsers/jsoncpp/archive/1.9.5.tar.gz"),
+    )
+    tf_http_archive(
+        name = "zlib",
+        build_file = "@xla//third_party:zlib.BUILD",
+        sha256 = "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
+        strip_prefix = "zlib-1.3.1",
+        urls = tf_mirror_urls("https://zlib.net/zlib-1.3.1.tar.gz"),
     )
     _dummy_repos(mctx)
 

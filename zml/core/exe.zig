@@ -335,11 +335,12 @@ pub const Exe = struct {
     /// Donated input contents cannot be used after the call; output buffers have their own handles.
     /// Use a runner to destroy donated handles automatically and replace buffers through output destinations.
     pub fn call(self: *const Exe, io: std.Io, arguments: Arguments, results_: *Results, opts: CallOpts) void {
-        var span = tracer.span("zml.exe.call", .{
+        const trace_context: tracer.Context = .init(.pjrt_library_call);
+        var span = tracer.span_at_for(@src(), "zml.exe.call", .{
             .wait = opts.wait,
             .arg_count = arguments.expected_shapes.len,
             .result_count = results_.expected_shapes.len,
-        });
+        }, .{ .producer = trace_context });
         defer span.end();
 
         var events: [Platform.MAX_NUM_DEVICES]?*pjrt.Event = @splat(null);
@@ -358,6 +359,7 @@ pub const Exe = struct {
             // TODO: Set this flag for undonatable buffers.
             .non_donatable_input_indices = &.{},
             .context = self.context,
+            .traceme_context_id = trace_context.id,
         }) catch |err| {
             std.debug.panic("PJRT_LoadedExecutable_Execute failed with: {}", .{err});
         };
