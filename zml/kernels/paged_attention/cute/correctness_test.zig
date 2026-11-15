@@ -69,6 +69,28 @@ test "indexed long selections handle sinks tails and inactive capacity" {
     };
 }
 
+test "indexed eight-head tiles handle tails and packed capacity" {
+    const platform = zml.testing.env();
+    if (platform.target != .cuda) return error.CudaRequired;
+    const suite = [_]cases.Case{
+        .{ .name = "sparse_eight_head_mixed_tail", .head_dim = 512, .batch = 3, .kv_heads = 1, .group = 19, .prefill = 1, .inactive = 1, .chunk = 3, .token_capacity = 9, .kv_len = 2049, .mask = .indices, .topk = 513, .sink = true, .shuffle_pages = true },
+        .{ .name = "sparse_eight_head_small_tail", .head_dim = 64, .batch = 4, .group = 5, .prefill = 1, .inactive = 1, .chunk = 3, .token_capacity = 9, .mask = .indices, .topk = 65, .sink = true, .shuffle_pages = true },
+        .{ .name = "sparse_eight_head_empty_capacity", .head_dim = 512, .batch = 3, .kv_heads = 1, .group = 16, .inactive = 1, .token_capacity = 6, .mask = .indices, .topk = 513, .empty_indices = true, .sink = true, .sink_value = -std.math.inf(f32) },
+    };
+    for ([_]zml.DataType{ .bf16, .f16 }) |dtype| for (suite) |c| {
+        std.debug.print("CASE name={s} backend=cute compute_dtype={s}\n", .{ c.name, @tagName(dtype) });
+        const tuning: zml.paged_attention.cute.SparseTuning = .{
+            .headRows = 8,
+            .warps = 8,
+            .kvTile = 32,
+            .splits = if (c.head_dim == 64) 3 else null,
+            .mergeLanes = if (c.head_dim == 64) 8 else 32,
+            .mergeVector = if (c.head_dim == 64) 4 else 8,
+        };
+        try runCorrectnessTuned(std.testing.allocator, std.testing.io, platform, c, .cute, dtype, tuning);
+    };
+}
+
 fn runSparseCorrectness(dtype: zml.DataType) !void {
     const platform = zml.testing.env();
     if (platform.target != .cuda) return error.CudaRequired;
@@ -88,8 +110,12 @@ fn runSparseCorrectness(dtype: zml.DataType) !void {
 }
 
 fn runCorrectness(a: std.mem.Allocator, io: std.Io, platform: *const zml.Platform, c: cases.Case, backend: fixtures.Backend, dtype: zml.DataType) !void {
+    return runCorrectnessTuned(a, io, platform, c, backend, dtype, .{});
+}
+
+fn runCorrectnessTuned(a: std.mem.Allocator, io: std.Io, platform: *const zml.Platform, c: cases.Case, backend: fixtures.Backend, dtype: zml.DataType, tuning: zml.paged_attention.cute.SparseTuning) !void {
     const inputs = Inputs.initDType(c, dtype);
-    const exe = try platform.compileFn(a, io, fixtures.forwardBackend, .{ inputs, c, backend }, .{ .program_name = "paged_attention_harness" });
+    const exe = try platform.compileFn(a, io, fixtures.forwardBackendTuned, .{ inputs, c, backend, tuning }, .{ .program_name = "paged_attention_harness" });
     defer exe.deinit();
 
     var runner = try exe.runner(a);

@@ -8,6 +8,7 @@ const Inputs = fixtures.Inputs;
 const Args = struct {
     profile_dir: ?[]const u8 = null,
     paired: bool = false,
+    tuning: zml.paged_attention.cute.SparseTuning = .{},
     sparse: bool = false,
     stress: bool = false,
     all_backends: bool = false,
@@ -31,6 +32,7 @@ pub fn main(init: std.process.Init) !void {
     });
     std.debug.print("timing=synchronized_invocation_us devices={d} hkv=per_device (KV heads sharded across all visible GPUs; includes runtime, output allocation, attention, merge and wait; excludes compile, upload, reference validation and output destruction)\n", .{platform.devices.len});
 
+    std.debug.print("TUNING {any}\n", .{args.tuning});
     const suite: []const cases.Case = if (args.stress) &cases.sparseStressBenchmarks else if (args.sparse) &cases.sparseBenchmarks else &cases.benchmarks;
     var failures: usize = 0;
     var selected: usize = 0;
@@ -83,6 +85,20 @@ fn parseArgs(init: std.process.Init) !Args {
         } else if (std.mem.eql(u8, arg, "--stress")) {
             result.sparse = true;
             result.stress = true;
+        } else if (std.mem.startsWith(u8, arg, "--tune-head-rows=")) {
+            result.tuning.headRows = try std.fmt.parseInt(i64, arg["--tune-head-rows=".len..], 10);
+        } else if (std.mem.startsWith(u8, arg, "--tune-warps=")) {
+            result.tuning.warps = try std.fmt.parseInt(i64, arg["--tune-warps=".len..], 10);
+        } else if (std.mem.startsWith(u8, arg, "--tune-tile=")) {
+            result.tuning.kvTile = try std.fmt.parseInt(i64, arg["--tune-tile=".len..], 10);
+        } else if (std.mem.startsWith(u8, arg, "--tune-splits=")) {
+            result.tuning.splits = try std.fmt.parseInt(i64, arg["--tune-splits=".len..], 10);
+        } else if (std.mem.startsWith(u8, arg, "--tune-merge-lanes=")) {
+            result.tuning.mergeLanes = try std.fmt.parseInt(i64, arg["--tune-merge-lanes=".len..], 10);
+        } else if (std.mem.startsWith(u8, arg, "--tune-merge-vector=")) {
+            result.tuning.mergeVector = try std.fmt.parseInt(i64, arg["--tune-merge-vector=".len..], 10);
+        } else if (std.mem.startsWith(u8, arg, "--tune-merge-parts=")) {
+            result.tuning.mergeParts = try std.fmt.parseInt(i64, arg["--tune-merge-parts=".len..], 10);
         } else if (std.mem.startsWith(u8, arg, "--backend=")) {
             const value = arg["--backend=".len..];
             result.all_backends = std.mem.eql(u8, value, "all");
@@ -100,11 +116,18 @@ fn parseArgs(init: std.process.Init) !Args {
             result.samples = try std.fmt.parseInt(usize, arg["--samples=".len..], 10);
             if (result.samples == 0) return error.InvalidSamples;
         } else if (std.mem.eql(u8, arg, "--help")) {
-            std.debug.print("paged attention benchmark [--sparse|--stress] [--paired] [--backend=cute|cute_generic|triton|all] [--case=INDEX|NAME] [--dtype=bf16|f16] [--warmup=10] [--samples=101] [--profile-dir=PATH]\nSparse mode compares all three backends on identical seed-42 inputs; the default dense suite uses CuTe. Every measured case is first checked against the CPU reference. Use --stress --backend=NAME to isolate large-group backend resource limits.\n", .{});
+            std.debug.print("paged attention benchmark [--sparse|--stress] [--paired] [--backend=cute|cute_generic|triton|all] [--case=INDEX|NAME] [--dtype=bf16|f16] [--warmup=10] [--samples=101] [--profile-dir=PATH] [--tune-head-rows=N --tune-warps=N --tune-tile=N --tune-splits=N --tune-merge-parts=N --tune-merge-vector=N --tune-merge-lanes=N ]\nSparse mode compares all three backends on identical seed-42 inputs; the default dense suite uses CuTe. Every measured case is first checked against the CPU reference. Use --stress --backend=NAME to isolate large-group backend resource limits.\n", .{});
             std.process.exit(0);
         } else return error.UnknownArgument;
     }
-    if (result.paired and (result.stress or result.backend != null or result.profile_dir != null)) return error.InvalidPairedOptions;
+    if (result.tuning.headRows) |v| if (v != 8 and v != 16) return error.InvalidTuning;
+    if (result.tuning.splits) |v| if (v < 1 or v > 128) return error.InvalidTuning;
+    if (result.tuning.mergeLanes) |v| if (std.mem.indexOfScalar(i64, &.{ 8, 16, 32 }, v) == null) return error.InvalidTuning;
+    if (result.tuning.mergeVector) |v| if (std.mem.indexOfScalar(i64, &.{ 0, 4, 8, 16 }, v) == null) return error.InvalidTuning;
+    if (result.tuning.warps) |v| if (std.mem.indexOfScalar(i64, &.{ 1, 2, 4, 8 }, v) == null) return error.InvalidTuning;
+    if (result.tuning.kvTile) |v| if (std.mem.indexOfScalar(i64, &.{ 16, 32, 64, 128 }, v) == null) return error.InvalidTuning;
+    if (result.tuning.mergeParts) |v| if (std.mem.indexOfScalar(i64, &.{ 4, 8, 16, 32 }, v) == null) return error.InvalidTuning;
+    if (result.paired and (result.stress or result.backend != null)) return error.InvalidPairedOptions;
     return result;
 }
 
@@ -119,7 +142,7 @@ fn runBenchmark(a: std.mem.Allocator, io: std.Io, platform: *const zml.Platform,
     inputs.sinks = inputs.sinks.withPartitioning(mesh, .{ ._0 = .model });
 
     const compile_start: std.Io.Timestamp = .now(io, .awake);
-    const exe = try platform.compileFn(a, io, forward, .{ inputs, global_case, mesh, backend }, .{
+    const exe = try platform.compileFn(a, io, forward, .{ inputs, global_case, mesh, backend, args.tuning }, .{
         .program_name = "paged_attention_harness",
         .meshes = &.{mesh},
     });
@@ -180,18 +203,19 @@ fn runBenchmark(a: std.mem.Allocator, io: std.Io, platform: *const zml.Platform,
     });
 }
 
-fn forward(inputs: Inputs, c: cases.Case, mesh: *const zml.Mesh, backend: fixtures.Backend) zml.Tensor {
+fn forward(inputs: Inputs, c: cases.Case, mesh: *const zml.Mesh, backend: fixtures.Backend, tuning: zml.paged_attention.cute.SparseTuning) zml.Tensor {
     const Call = struct {
         inputs: Inputs,
         case: cases.Case,
         backend: fixtures.Backend,
+        tuning: zml.paged_attention.cute.SparseTuning,
 
         fn local(self: @This(), _: zml.Shape) zml.Tensor {
-            return fixtures.forwardBackend(self.inputs, self.case, self.backend);
+            return fixtures.forwardBackendTuned(self.inputs, self.case, self.backend, self.tuning);
         }
     };
     const heads: zml.Sharding.Partitioning.Logical = .parse(.{ .hkv = .model });
-    return zml.ops.manualComputation(Call.local, .{ .inputs = inputs, .case = c, .backend = backend }, inputs.q.shape(), mesh, .{
+    return zml.ops.manualComputation(Call.local, .{ .inputs = inputs, .case = c, .backend = backend, .tuning = tuning }, inputs.q.shape(), mesh, .{
         .in_specs = .{ .inputs = .{
             .q = heads,
             .k = heads,
@@ -238,7 +262,9 @@ fn runPaired(a: std.mem.Allocator, io: std.Io, platform: *const zml.Platform, me
     for (&samples) |*v| v.* = try arena.allocator().alloc(f64, args.samples);
     for (backends, 0..) |backend, i| {
         const start: std.Io.Timestamp = .now(io, .awake);
-        executables[i] = try platform.compileFn(a, io, forward, .{ inputs, global_case, mesh, backend }, .{ .program_name = "paired_attention", .meshes = &.{mesh} });
+        const programName = try std.fmt.allocPrint(a, "paired_attention_{s}", .{@tagName(backend)});
+        defer a.free(programName);
+        executables[i] = try platform.compileFn(a, io, forward, .{ inputs, global_case, mesh, backend, args.tuning }, .{ .program_name = programName, .meshes = &.{mesh} });
         compiled += 1;
         compile_us[i] = elapsedUs(start, io);
         runners[i] = try executables[i].runner(a);
@@ -250,7 +276,19 @@ fn runPaired(a: std.mem.Allocator, io: std.Io, platform: *const zml.Platform, me
         defer host.free(a);
         errors[i] = if (args.dtype == .f16) try reference.check(a, global_case, fixture, host.items(f16)) else try reference.check(a, global_case, fixture, host.items(zml.floats.BFloat16));
     }
+    const session = try std.fmt.allocPrint(a, "{s}-{d}-paired", .{ @tagName(args.dtype), index });
+    defer a.free(session);
+    var profiler = if (args.profile_dir) |path| try platform.profiler(a, io, .{
+        .repository_path = path,
+        .session_id = session,
+        .host_tracer_level = 0,
+        .device_tracer_level = 1,
+        .python_tracer_level = 0,
+        .raise_error_on_start_failure = true,
+    }) else null;
+    defer if (profiler) |*p| p.deinit();
     for (0..args.warmup + args.samples) |round| {
+        if (round == args.warmup) if (profiler) |*p| try p.start();
         for (0..backends.len) |rank| {
             const i = (rank + round) % backends.len;
             var output: zml.Buffer = undefined;
@@ -261,6 +299,7 @@ fn runPaired(a: std.mem.Allocator, io: std.Io, platform: *const zml.Platform, me
             output.deinit();
         }
     }
+    if (profiler) |*p| _ = try p.stop();
     const deltas = try arena.allocator().alloc(f64, args.samples);
     const ratios = try arena.allocator().alloc(f64, args.samples);
     const cute_index = @backingInt(fixtures.Backend.cute);

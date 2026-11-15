@@ -82,7 +82,7 @@ fn sparseIndices(q: zml.Tensor, indices: zml.Tensor) zml.Tensor {
 pub fn pagedAttention(parameters: Parameters, q: zml.Tensor, k: zml.Tensor, v: zml.Tensor, opts: AttentionOptions) zml.Tensor {
     validateInputs(q, k, v);
     if (opts.mask == .indices)
-        return pagedSparseAttention(parameters, q, k, v, opts);
+        return pagedSparseAttention(parameters, q, k, v, opts, .{});
     if (sm10x.isAvailable(zml.Compiler.current().platform))
         return sm10x.pagedAttention(parameters, q, k, v, opts);
     if (sm120.isAvailable(zml.Compiler.current().platform))
@@ -134,7 +134,25 @@ pub fn pagedAttentionGeneric(parameters: Parameters, q: zml.Tensor, k: zml.Tenso
     }).out.transpose(q.shape());
 }
 
-fn pagedSparseAttention(parameters: Parameters, q: zml.Tensor, k: zml.Tensor, v: zml.Tensor, opts: AttentionOptions) zml.Tensor {
+// Overrides let the kernel benchmark evaluate launch geometry without changing
+// the production policy or either comparison backend.
+pub const SparseTuning = struct {
+    headRows: ?i64 = null,
+    warps: ?i64 = null,
+    kvTile: ?i64 = null,
+    splits: ?i64 = null,
+    mergeParts: ?i64 = null,
+    mergeVector: ?i64 = null,
+    mergeLanes: ?i64 = null,
+};
+
+pub fn pagedAttentionTuned(parameters: Parameters, q: zml.Tensor, k: zml.Tensor, v: zml.Tensor, opts: AttentionOptions, tuning: SparseTuning) zml.Tensor {
+    validateInputs(q, k, v);
+    stdx.debug.assert(opts.mask == .indices, "Sparse tuning requires indexed attention", .{});
+    return pagedSparseAttention(parameters, q, k, v, opts, tuning);
+}
+
+fn pagedSparseAttention(parameters: Parameters, q: zml.Tensor, k: zml.Tensor, v: zml.Tensor, opts: AttentionOptions, tuning: SparseTuning) zml.Tensor {
     const q_ = q.transpose(.{ .b, .hkv, .hg, .hd });
     const k_ = k.transpose(.{ .page, .k_chunk, .hkv, .hd });
     const v_ = v.transpose(.{ .page, .k_chunk, .hkv, .hd });
@@ -160,7 +178,36 @@ fn pagedSparseAttention(parameters: Parameters, q: zml.Tensor, k: zml.Tensor, v:
         .sink = opts.sink != null,
         .decode = all_decode and parameters.options_.max_seqlen_q == 1,
     };
+    const platform = zml.Compiler.current().platform;
+    const cc = zml.platform.cuda.computeCapability(platform).?;
+    const narrowDecode = cfg.decode and cfg.tokens == 1 and cfg.batch == 1 and
+        ((cfg.head_dim == 64 and cfg.group <= 8 and cfg.topk > 128) or
+            (cfg.head_dim == 512 and cfg.group <= 16 and cfg.topk > 512));
+    // Underfilled GB300 grids benefit from eight real query rows per CTA.
+    // Vector merges amortize each partition's softmax state across features.
+    const narrowWork = cfg.kv_heads * @divTrunc(cfg.group + 7, 8) * @divTrunc(cfg.topk + 31, 32);
+    if (cc.major == 10 and cc.minor == 3 and narrowDecode and narrowWork <= @as(i64, @intCast(multiprocessorCount(platform)))) {
+        cfg.head_rows = 8;
+        cfg.warps = 8;
+        cfg.kv_tile = 32;
+        cfg.merge_vector = if (cfg.head_dim == 512) 8 else 4;
+        cfg.merge_lanes = if (cfg.head_dim == 512) 32 else 8;
+    }
+    if (tuning.headRows) |rows| {
+        stdx.debug.assert(rows == 8 or rows == 16, "Invalid sparse head tile", .{});
+        cfg.head_rows = rows;
+    }
+    if (tuning.warps) |warps| cfg.warps = warps;
+    if (tuning.kvTile) |tile| cfg.kv_tile = tile;
     cfg.merge_parts = if (cfg.head_dim >= 128 and cfg.head_dim <= 256 and cfg.tokens * cfg.kv_heads * cfg.group <= 16) 16 else 8;
+    if (tuning.mergeParts) |parts| cfg.merge_parts = parts;
+    if (tuning.mergeLanes) |lanes| cfg.merge_lanes = lanes;
+    stdx.debug.assert(cfg.merge_lanes == 8 or cfg.merge_lanes == 16 or cfg.merge_lanes == 32, "Invalid sparse merge lanes", .{});
+    if (tuning.mergeVector) |features| {
+        stdx.debug.assert(features == 0 or ((features == 4 or features == 8 or features == 16) and cfg.head_dim >= @divExact(128, cfg.merge_lanes) * features), "Invalid sparse merge vector", .{});
+        cfg.merge_vector = features;
+    }
+    stdx.debug.assert(@mod(cfg.head_dim, cfg.mergeFeatures()) == 0, "Sparse merge tile must divide the head dimension", .{});
     const work = @max(1, cfg.tokens * cfg.kv_heads * cfg.headTiles());
     // Short selections avoid a merge; longer decode selections expose one
     // selected tile per partition until the device has enough parallel work.
@@ -169,6 +216,10 @@ fn pagedSparseAttention(parameters: Parameters, q: zml.Tensor, k: zml.Tensor, v:
     var desired: i64 = 1;
     while (desired * work < target) desired *= 2;
     cfg.splits = if (short_selection) 1 else if (all_decode) @max(1, @min(128, @min(tiles, desired))) else if (cfg.head_dim <= 128) 1 else @max(1, @min(32, @min(@divTrunc(@divTrunc(target, 8) + work - 1, work), @divTrunc(cfg.topk, 128))));
+    if (tuning.splits) |splits| {
+        stdx.debug.assert(splits > 0 and splits <= tiles and splits <= 128, "Invalid sparse split count", .{});
+        cfg.splits = splits;
+    }
     const sink = if (opts.sink) |s| s.convert(.f32).reshape(.{cfg.kv_heads * cfg.group}) else zml.Tensor.scalar(0, .f32);
     if (cfg.group == 1 and cfg.topk <= 8) return sparse.Tiny.call(.{
         .q = q_,
@@ -200,7 +251,7 @@ fn pagedSparseAttention(parameters: Parameters, q: zml.Tensor, k: zml.Tensor, v:
     }).out;
     const result = if (cfg.splits > 1) sparse.Merge.call(.{ .partials = out, .starts = parameters.query_start_len, .sink = sink }, .{ .out = q_.shape() }, .{
         .cfg = cfg,
-        .grid = .{ @intCast(cfg.tokens), @intCast(cfg.kv_heads * cfg.group), @intCast(@divTrunc(cfg.head_dim, @divExact(128, cfg.merge_parts))) },
+        .grid = .{ @intCast(cfg.tokens), @intCast(cfg.kv_heads * cfg.group), @intCast(@divExact(cfg.head_dim, cfg.mergeFeatures())) },
         .block = .{ 128, 1, 1 },
     }).out else out;
     return result.transpose(q.shape());

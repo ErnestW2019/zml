@@ -140,6 +140,10 @@ pub fn forward(i: Inputs, c: cases.Case) zml.Tensor {
 }
 
 pub fn forwardBackend(i: Inputs, c: cases.Case, backend: Backend) zml.Tensor {
+    return forwardBackendTuned(i, c, backend, .{});
+}
+
+pub fn forwardBackendTuned(i: Inputs, c: cases.Case, backend: Backend, tuning: zml.paged_attention.cute.SparseTuning) zml.Tensor {
     const parameters: zml.paged_attention.cute.Parameters = .{
         .block_table = i.table,
         .seq_lens = i.lengths,
@@ -152,7 +156,7 @@ pub fn forwardBackend(i: Inputs, c: cases.Case, backend: Backend) zml.Tensor {
         },
     };
     return switch (backend) {
-        .cute => zml.paged_attention.cute.pagedAttention(parameters, i.q, i.k, i.v, i.options(c)),
+        .cute => if (c.mask == .indices) zml.paged_attention.cute.pagedAttentionTuned(parameters, i.q, i.k, i.v, i.options(c), tuning) else zml.paged_attention.cute.pagedAttention(parameters, i.q, i.k, i.v, i.options(c)),
         .cute_generic => zml.paged_attention.cute.pagedAttentionGeneric(parameters, i.q, i.k, i.v, i.options(c)),
         .triton => zml.paged_attention.triton.paged.pagedAttention(.{
             .block_table = i.table,
