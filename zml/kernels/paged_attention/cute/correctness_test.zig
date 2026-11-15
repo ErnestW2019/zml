@@ -55,6 +55,20 @@ test "indexed paged attention FP16 all backends" {
     try runSparseCorrectness(.f16);
 }
 
+test "indexed long selections handle sinks tails and inactive capacity" {
+    const platform = zml.testing.env();
+    if (platform.target != .cuda) return error.CudaRequired;
+    const suite = [_]cases.Case{
+        .{ .name = "sparse_wide_sink_tail", .head_dim = 512, .batch = 1, .kv_heads = 1, .group = 16, .kv_len = 2049, .mask = .indices, .topk = 1025, .sink = true, .shuffle_pages = true },
+        .{ .name = "sparse_wide_empty_capacity", .head_dim = 512, .batch = 3, .kv_heads = 1, .group = 5, .inactive = 1, .token_capacity = 6, .mask = .indices, .topk = 513, .empty_indices = true, .sink = true, .sink_value = -std.math.inf(f32) },
+        .{ .name = "sparse_wide_prefill", .head_dim = 512, .group = 3, .prefill = 1, .chunk = 3, .kv_len = 2049, .mask = .indices, .topk = 513, .sink = true, .shuffle_pages = true },
+    };
+    for ([_]zml.DataType{ .bf16, .f16 }) |dtype| for (suite) |c| for (std.enums.values(fixtures.Backend)) |backend| {
+        std.debug.print("CASE name={s} backend={s} compute_dtype={s}\n", .{ c.name, @tagName(backend), @tagName(dtype) });
+        try runCorrectness(std.testing.allocator, std.testing.io, platform, c, backend, dtype);
+    };
+}
+
 fn runSparseCorrectness(dtype: zml.DataType) !void {
     const platform = zml.testing.env();
     if (platform.target != .cuda) return error.CudaRequired;

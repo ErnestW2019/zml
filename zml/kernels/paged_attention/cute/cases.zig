@@ -108,6 +108,13 @@ pub const benchmarks = blk: {
 // Selection-slot tails, GQA head tails, and logical-to-physical page gathers
 // vary independently. Every nonempty fixture includes duplicate/invalid slots.
 pub const sparseCorrectness = [_]Case{
+    .{ .name = "sparse_decode_inactive", .head_dim = 64, .group = 5, .batch = 5, .inactive = 2, .token_capacity = 9, .mask = .indices, .topk = 65, .shuffle_pages = true },
+    .{ .name = "sparse_tiny_decode_inactive", .head_dim = 128, .group = 1, .batch = 5, .inactive = 2, .token_capacity = 9, .mask = .indices, .topk = 8, .sink = true, .shuffle_pages = true },
+    .{ .name = "sparse_tiny_d32_sink", .head_dim = 32, .group = 1, .mask = .indices, .topk = 1, .sink = true, .shuffle_pages = true },
+    .{ .name = "sparse_tiny_d64_disabled_sink", .head_dim = 64, .group = 1, .mask = .indices, .topk = 7, .empty_indices = true, .sink = true, .sink_value = -std.math.inf(f32) },
+    .{ .name = "sparse_tiny_d128_empty", .head_dim = 128, .group = 1, .mask = .indices, .topk = 8, .empty_indices = true },
+    .{ .name = "sparse_tiny_d256_capacity", .head_dim = 256, .group = 1, .batch = 4, .prefill = 1, .inactive = 1, .chunk = 3, .token_capacity = 9, .mask = .indices, .topk = 5, .sink = true, .shuffle_pages = true },
+    .{ .name = "sparse_tiny_d512_scale", .head_dim = 512, .group = 1, .mask = .indices, .topk = 8, .scale = -0.125, .shuffle_pages = true },
     .{ .name = "sparse_tiny_mha", .head_dim = 128, .group = 1, .mask = .indices, .topk = 8, .shuffle_pages = true },
     .{ .name = "sparse_d32_mha", .head_dim = 32, .group = 1, .mask = .indices, .topk = 32 },
     .{ .name = "sparse_d64_mqa", .head_dim = 64, .kv_heads = 1, .group = 8, .mask = .indices, .topk = 65 },

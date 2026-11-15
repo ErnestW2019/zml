@@ -140,9 +140,10 @@ fn pagedSparseAttention(parameters: Parameters, q: zml.Tensor, k: zml.Tensor, v:
     const v_ = v.transpose(.{ .page, .k_chunk, .hkv, .hd });
     stdx.debug.assert(q_.dim(.hkv) == k_.dim(.hkv) and k_.shape().eql(v_.shape()) and k_.dim(.hd) == q_.dim(.hd) and q_.dim(.hg) > 0, "CuTe paged attention requires aligned local Q/KV heads and matching caches", .{});
     const indices = sparseIndices(q_, opts.mask.indices);
-    // A short, single-head selection has no KV reuse to amortize MMA tiling.
-    if (q_.dim(.hg) == 1 and indices.dim(.topk) <= 8)
-        return pagedAttentionGeneric(parameters, q, k, v, opts);
+    const all_decode = !parameters.options_.is_prefill;
+    const short_selection = all_decode and q_.dim(.hd) <= 128 and indices.dim(.topk) <= 128;
+    const fine_tile = all_decode and q_.dim(.b) == 1 and ((q_.dim(.hd) == 512 and indices.dim(.topk) <= 512) or (q_.dim(.hd) >= 128 and q_.dim(.hd) < 512 and q_.dim(.hg) <= 16));
+    const split_features = all_decode and (q_.dim(.hd) == 512 or (fine_tile and indices.dim(.topk) > 128));
     var cfg: sparse.Config = .{
         .head_dim = q_.dim(.hd),
         .tokens = q_.dim(.b),
@@ -153,20 +154,36 @@ fn pagedSparseAttention(parameters: Parameters, q: zml.Tensor, k: zml.Tensor, v:
         .page_size = k_.dim(.k_chunk),
         .topk = indices.dim(.topk),
         .dtype = zml.kernel.cute.from(q_.dtype()),
-        .kv_tile = if (!parameters.options_.is_prefill and q_.dim(.hd) <= 256) 16 else if (q_.dim(.hd) == 512) 32 else 64,
-        .warps = if (!parameters.options_.is_prefill and q_.dim(.hd) <= 256) @max(1, @divTrunc(q_.dim(.hd), 128)) else 4,
+        .kv_tile = if (short_selection) (if (indices.dim(.topk) <= 32) @as(i64, 32) else 128) else if (fine_tile) 16 else if (all_decode or q_.dim(.hd) == 512) 32 else 64,
+        .warps = if (split_features) 8 else 4,
         .scale = opts.scale orelse 1 / @sqrt(@as(f32, @floatFromInt(q_.dim(.hd)))),
         .sink = opts.sink != null,
+        .decode = all_decode and parameters.options_.max_seqlen_q == 1,
     };
+    cfg.merge_parts = if (cfg.head_dim >= 128 and cfg.head_dim <= 256 and cfg.tokens * cfg.kv_heads * cfg.group <= 16) 16 else 8;
     const work = @max(1, cfg.tokens * cfg.kv_heads * cfg.headTiles());
-    // Narrow decode CTAs keep about 64 FP32 output registers per thread.
-    // One selected tile per partition exposes parallelism at small batches.
+    // Short selections avoid a merge; longer decode selections expose one
+    // selected tile per partition until the device has enough parallel work.
     const target = @as(i64, @intCast(multiprocessorCount(zml.Compiler.current().platform))) * 16;
     const tiles = @divTrunc(cfg.topk + cfg.kv_tile - 1, cfg.kv_tile);
     var desired: i64 = 1;
     while (desired * work < target) desired *= 2;
-    cfg.splits = if (!parameters.options_.is_prefill) @max(1, @min(128, @min(tiles, desired))) else if (cfg.head_dim <= 128) 1 else @max(1, @min(32, @min(@divTrunc(@divTrunc(target, 8) + work - 1, work), @divTrunc(cfg.topk, 128))));
+    cfg.splits = if (short_selection) 1 else if (all_decode) @max(1, @min(128, @min(tiles, desired))) else if (cfg.head_dim <= 128) 1 else @max(1, @min(32, @min(@divTrunc(@divTrunc(target, 8) + work - 1, work), @divTrunc(cfg.topk, 128))));
     const sink = if (opts.sink) |s| s.convert(.f32).reshape(.{cfg.kv_heads * cfg.group}) else zml.Tensor.scalar(0, .f32);
+    if (cfg.group == 1 and cfg.topk <= 8) return sparse.Tiny.call(.{
+        .q = q_,
+        .k = k_,
+        .v = v_,
+        .table = parameters.block_table,
+        .lengths = parameters.seq_lens,
+        .starts = parameters.query_start_len,
+        .sink = sink,
+        .indices = indices,
+    }, .{ .out = q_.shape() }, .{
+        .cfg = cfg,
+        .grid = .{ @intCast(cfg.tokens), @intCast(cfg.kv_heads), 1 },
+        .block = .{ if (cfg.topk > 4) @as(i32, 256) else 128, 1, 1 },
+    }).out.transpose(q.shape());
     const out = sparse.Kernel.call(.{
         .q = q_,
         .k = k_,
@@ -176,15 +193,15 @@ fn pagedSparseAttention(parameters: Parameters, q: zml.Tensor, k: zml.Tensor, v:
         .starts = parameters.query_start_len,
         .sink = sink,
         .indices = indices,
-    }, .{ .out = if (cfg.splits > 1) zml.Shape.init(.{ cfg.splits, cfg.tokens, cfg.kv_heads * cfg.group, cfg.head_dim + 2 }, .f32) else q_.shape() }, .{
+    }, .{ .out = if (cfg.splits > 1) zml.Shape.init(.{ cfg.tokens, cfg.kv_heads * cfg.group, cfg.splits, cfg.partialWidth() }, .f32) else q_.shape() }, .{
         .cfg = cfg,
         .grid = .{ @intCast(cfg.tokens), @intCast(cfg.kv_heads * cfg.headTiles()), @intCast(cfg.splits) },
         .block = .{ @intCast(cfg.warps * 32), 1, 1 },
     }).out;
     const result = if (cfg.splits > 1) sparse.Merge.call(.{ .partials = out, .starts = parameters.query_start_len, .sink = sink }, .{ .out = q_.shape() }, .{
         .cfg = cfg,
-        .grid = .{ @intCast(cfg.tokens), @intCast(cfg.kv_heads * cfg.group), @intCast(@divTrunc(cfg.head_dim + 63, 64)) },
-        .block = .{ 64, 1, 1 },
+        .grid = .{ @intCast(cfg.tokens), @intCast(cfg.kv_heads * cfg.group), @intCast(@divTrunc(cfg.head_dim, @divExact(128, cfg.merge_parts))) },
+        .block = .{ 128, 1, 1 },
     }).out else out;
     return result.transpose(q.shape());
 }

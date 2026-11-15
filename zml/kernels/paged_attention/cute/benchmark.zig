@@ -7,6 +7,7 @@ const Inputs = fixtures.Inputs;
 
 const Args = struct {
     profile_dir: ?[]const u8 = null,
+    paired: bool = false,
     sparse: bool = false,
     stress: bool = false,
     all_backends: bool = false,
@@ -41,6 +42,10 @@ pub fn main(init: std.process.Init) !void {
             } else if (!std.mem.eql(u8, filter, c.name)) continue;
         }
         selected += 1;
+        if (args.paired) {
+            try runPaired(init.gpa, init.io, platform, mesh, c, index, args);
+            continue;
+        }
         const backends = std.enums.values(fixtures.Backend);
         for (0..backends.len) |rank| {
             const backend = backends[(rank + index) % backends.len];
@@ -73,6 +78,8 @@ fn parseArgs(init: std.process.Init) !Args {
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--sparse")) {
             result.sparse = true;
+        } else if (std.mem.eql(u8, arg, "--paired")) {
+            result.paired = true;
         } else if (std.mem.eql(u8, arg, "--stress")) {
             result.sparse = true;
             result.stress = true;
@@ -93,10 +100,11 @@ fn parseArgs(init: std.process.Init) !Args {
             result.samples = try std.fmt.parseInt(usize, arg["--samples=".len..], 10);
             if (result.samples == 0) return error.InvalidSamples;
         } else if (std.mem.eql(u8, arg, "--help")) {
-            std.debug.print("paged attention benchmark [--sparse|--stress] [--backend=cute|cute_generic|triton|all] [--case=INDEX|NAME] [--dtype=bf16|f16] [--warmup=10] [--samples=101] [--profile-dir=PATH]\nSparse mode compares all three backends on identical seed-42 inputs; the default dense suite uses CuTe. Every measured case is first checked against the CPU reference. Use --stress --backend=NAME to isolate large-group backend resource limits.\n", .{});
+            std.debug.print("paged attention benchmark [--sparse|--stress] [--paired] [--backend=cute|cute_generic|triton|all] [--case=INDEX|NAME] [--dtype=bf16|f16] [--warmup=10] [--samples=101] [--profile-dir=PATH]\nSparse mode compares all three backends on identical seed-42 inputs; the default dense suite uses CuTe. Every measured case is first checked against the CPU reference. Use --stress --backend=NAME to isolate large-group backend resource limits.\n", .{});
             std.process.exit(0);
         } else return error.UnknownArgument;
     }
+    if (result.paired and (result.stress or result.backend != null or result.profile_dir != null)) return error.InvalidPairedOptions;
     return result;
 }
 
@@ -200,4 +208,74 @@ fn forward(inputs: Inputs, c: cases.Case, mesh: *const zml.Mesh, backend: fixtur
 
 fn elapsedUs(start: std.Io.Timestamp, io: std.Io) f64 {
     return @as(f64, @floatFromInt(start.untilNow(io, .awake).toNanoseconds())) / 1000;
+}
+
+// Keep all executables and inputs alive and rotate order for each sample round.
+fn runPaired(a: std.mem.Allocator, io: std.Io, platform: *const zml.Platform, mesh: *const zml.Mesh, c: cases.Case, index: usize, args: Args) !void {
+    var global_case = c;
+    global_case.kv_heads *= platform.devices.len;
+    var inputs = Inputs.initDType(global_case, args.dtype);
+    inputs.q = inputs.q.withPartitioning(mesh, .{ .hkv = .model });
+    inputs.k = inputs.k.withPartitioning(mesh, .{ .hkv = .model });
+    inputs.v = inputs.v.withPartitioning(mesh, .{ .hkv = .model });
+    inputs.sinks = inputs.sinks.withPartitioning(mesh, .{ ._0 = .model });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const fixture = try fixtures.Fixture.init(arena.allocator(), global_case);
+    if (args.dtype == .f16) fixture.quantizeF16();
+    var buffers = try fixtures.upload(a, io, platform, inputs, fixture);
+    defer zml.Buffer.deinitAll(Inputs, &buffers);
+    const backends = std.enums.values(fixtures.Backend);
+    var executables: [3]zml.Exe = undefined;
+    var runners: [3]zml.Exe.Runner = undefined;
+    var compiled: usize = 0;
+    var initialized: usize = 0;
+    defer for (executables[0..compiled]) |e| e.deinit();
+    defer for (runners[0..initialized]) |*r| r.deinit(a);
+    var errors: [3]f32 = undefined;
+    var compile_us: [3]f64 = undefined;
+    var samples: [3][]f64 = undefined;
+    for (&samples) |*v| v.* = try arena.allocator().alloc(f64, args.samples);
+    for (backends, 0..) |backend, i| {
+        const start: std.Io.Timestamp = .now(io, .awake);
+        executables[i] = try platform.compileFn(a, io, forward, .{ inputs, global_case, mesh, backend }, .{ .program_name = "paired_attention", .meshes = &.{mesh} });
+        compiled += 1;
+        compile_us[i] = elapsedUs(start, io);
+        runners[i] = try executables[i].runner(a);
+        initialized += 1;
+        var output: zml.Buffer = undefined;
+        runners[i].run(io, .{buffers}, .{&output}, .{ .wait = true });
+        defer output.deinit();
+        var host = try output.toSliceAlloc(a, io);
+        defer host.free(a);
+        errors[i] = if (args.dtype == .f16) try reference.check(a, global_case, fixture, host.items(f16)) else try reference.check(a, global_case, fixture, host.items(zml.floats.BFloat16));
+    }
+    for (0..args.warmup + args.samples) |round| {
+        for (0..backends.len) |rank| {
+            const i = (rank + round) % backends.len;
+            var output: zml.Buffer = undefined;
+            const start: std.Io.Timestamp = .now(io, .awake);
+            runners[i].run(io, .{buffers}, .{&output}, .{ .wait = true });
+            const us = elapsedUs(start, io);
+            if (round >= args.warmup) samples[i][round - args.warmup] = us;
+            output.deinit();
+        }
+    }
+    const deltas = try arena.allocator().alloc(f64, args.samples);
+    const ratios = try arena.allocator().alloc(f64, args.samples);
+    const cute_index = @backingInt(fixtures.Backend.cute);
+    const triton_index = @backingInt(fixtures.Backend.triton);
+    for (deltas, ratios, 0..) |*delta, *ratio, i| {
+        delta.* = samples[cute_index][i] - samples[triton_index][i];
+        ratio.* = samples[triton_index][i] / samples[cute_index][i];
+    }
+    std.mem.sort(f64, deltas, {}, std.sort.asc(f64));
+    std.mem.sort(f64, ratios, {}, std.sort.asc(f64));
+    std.debug.print("PAIR index={d} compute_dtype={s} n={d} cute_minus_triton_median_us={d:.3} triton_over_cute_median={d:.6} delta_p10_us={d:.3} delta_p90_us={d:.3}\n", .{ index, @tagName(args.dtype), deltas.len, deltas[deltas.len / 2], ratios[ratios.len / 2], deltas[deltas.len / 10], deltas[(deltas.len - 1) * 9 / 10] });
+    for (backends, 0..) |backend, i| {
+        const values = samples[i];
+        std.mem.sort(f64, values, {}, std.sort.asc(f64));
+        const median = if (values.len % 2 == 0) (values[values.len / 2 - 1] + values[values.len / 2]) / 2 else values[values.len / 2];
+        std.debug.print("RESULT index={d} name={s} d={d} b={d} hkv={d} g={d} prefill={d} chunk={d} kv={d} topk={d} backend={s} compute_dtype={s} check=all_outputs paired=true max_abs={d:.6} compile_ms={d:.3} n={d} median_us={d:.3} p10_us={d:.3} p90_us={d:.3}\n", .{ index, c.name, c.head_dim, c.batch, c.kv_heads, c.group, c.prefill, if (c.prefill > 0) c.chunk else 1, c.kv_len, c.topk, @tagName(backend), @tagName(args.dtype), errors[i], compile_us[i] / 1000, values.len, median, values[values.len / 10], values[(values.len - 1) * 9 / 10] });
+    }
 }
