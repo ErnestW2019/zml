@@ -27,7 +27,7 @@ test "paged attention correctness" {
             c.name, c.head_dim, c.batch, c.kv_heads, c.group, c.prefill, if (c.prefill > 0) c.chunk else 1, c.kv_len, @tagName(c.mask),
         });
 
-        runCorrectness(a, io, platform, c, false) catch |err| {
+        runCorrectness(a, io, platform, c, .cute, .bf16) catch |err| {
             failures += 1;
             std.debug.print("FAIL error={s}\n", .{@errorName(err)});
         };
@@ -44,19 +44,38 @@ test "FP16 paged attention" {
         .{ .name = "fp16_mixed", .prefill = 1, .mask = .non_causal },
         .{ .name = "fp16_window_sink", .head_dim = 256, .prefill = 1, .mask = .window, .sink = true },
         .{ .name = "fp16_split_sink", .head_dim = 512, .batch = 1, .kv_len = 2049, .sink = true, .shuffle_pages = true },
-    }) |c| try runCorrectness(std.testing.allocator, std.testing.io, platform, c, true);
+    }) |c| try runCorrectness(std.testing.allocator, std.testing.io, platform, c, .cute, .f16);
 }
 
-fn forwardF16(i: Inputs, c: cases.Case) zml.Tensor {
-    var inputs = i;
-    inputs.q = i.q.convert(.f16);
-    inputs.k = i.k.convert(.f16);
-    inputs.v = i.v.convert(.f16);
-    return fixtures.forward(inputs, c).convert(.bf16);
+test "indexed paged attention BF16 all backends" {
+    try runSparseCorrectness(.bf16);
 }
 
-fn runCorrectness(a: std.mem.Allocator, io: std.Io, platform: *const zml.Platform, c: cases.Case, comptime compute_f16: bool) !void {
-    const exe = try platform.compileFn(a, io, if (compute_f16) forwardF16 else fixtures.forward, .{ Inputs.init(c), c }, .{ .program_name = "paged_attention_harness" });
+test "indexed paged attention FP16 all backends" {
+    try runSparseCorrectness(.f16);
+}
+
+fn runSparseCorrectness(dtype: zml.DataType) !void {
+    const platform = zml.testing.env();
+    if (platform.target != .cuda) return error.CudaRequired;
+    var failures: usize = 0;
+    for (cases.sparseCorrectness) |c| {
+        for (std.enums.values(fixtures.Backend)) |backend| {
+            std.debug.print("CASE name={s} d={d} b={d} hkv={d} g={d} prefill={d} chunk={d} kv={d} topk={d} backend={s} compute_dtype={s}\n", .{
+                c.name, c.head_dim, c.batch, c.kv_heads, c.group, c.prefill, if (c.prefill > 0) c.chunk else 1, c.kv_len, c.topk, @tagName(backend), @tagName(dtype),
+            });
+            runCorrectness(std.testing.allocator, std.testing.io, platform, c, backend, dtype) catch |err| {
+                failures += 1;
+                std.debug.print("FAIL error={s}\n", .{@errorName(err)});
+            };
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), failures);
+}
+
+fn runCorrectness(a: std.mem.Allocator, io: std.Io, platform: *const zml.Platform, c: cases.Case, backend: fixtures.Backend, dtype: zml.DataType) !void {
+    const inputs = Inputs.initDType(c, dtype);
+    const exe = try platform.compileFn(a, io, fixtures.forwardBackend, .{ inputs, c, backend }, .{ .program_name = "paged_attention_harness" });
     defer exe.deinit();
 
     var runner = try exe.runner(a);
@@ -66,17 +85,9 @@ fn runCorrectness(a: std.mem.Allocator, io: std.Io, platform: *const zml.Platfor
     defer arena.deinit();
 
     const fixture = try fixtures.Fixture.init(arena.allocator(), c);
-    if (compute_f16) {
-        // Exactly representable in both formats, so the existing CPU reference
-        // receives precisely the values used by the FP16 tensor-core path.
-        for ([_][]zml.floats.BFloat16{ fixture.q, fixture.k, fixture.v }) |values| {
-            for (values) |*v| if (std.math.isFinite(v.toF32())) {
-                v.* = .fromF32(@round(v.toF32() * 64) / 64);
-            };
-        }
-    }
+    if (dtype == .f16) fixture.quantizeF16();
 
-    var buffers = try fixtures.upload(io, platform, Inputs.init(c), fixture);
+    var buffers = try fixtures.upload(a, io, platform, inputs, fixture);
     defer zml.Buffer.deinitAll(Inputs, &buffers);
 
     var output: zml.Buffer = undefined;
@@ -86,8 +97,18 @@ fn runCorrectness(a: std.mem.Allocator, io: std.Io, platform: *const zml.Platfor
     var host = try output.toSliceAlloc(a, io);
     defer host.free(a);
 
-    const max_error = try reference.check(a, c, fixture, host.items(zml.floats.BFloat16));
-    std.debug.print("RESULT name={s} d={d} b={d} hkv={d} g={d} prefill={d} chunk={d} kv={d} backend=cute compute_dtype={s} check=all_outputs max_abs={d:.6}\n", .{
-        c.name, c.head_dim, c.batch, c.kv_heads, c.group, c.prefill, if (c.prefill > 0) c.chunk else 1, c.kv_len, if (compute_f16) "f16" else "bf16", max_error,
+    const max_error = if (dtype == .f16)
+        try reference.check(a, c, fixture, host.items(f16))
+    else
+        try reference.check(a, c, fixture, host.items(zml.floats.BFloat16));
+    if (backend != .triton) {
+        if (dtype == .f16) {
+            try reference.checkZeroTail(c, fixture, host.items(f16));
+        } else {
+            try reference.checkZeroTail(c, fixture, host.items(zml.floats.BFloat16));
+        }
+    }
+    std.debug.print("RESULT name={s} d={d} b={d} hkv={d} g={d} prefill={d} chunk={d} kv={d} topk={d} backend={s} compute_dtype={s} check=all_active_outputs inactive_tail={s} max_abs={d:.6}\n", .{
+        c.name, c.head_dim, c.batch, c.kv_heads, c.group, c.prefill, if (c.prefill > 0) c.chunk else 1, c.kv_len, c.topk, @tagName(backend), @tagName(dtype), if (backend == .triton) "unspecified" else "zero_checked", max_error,
     });
 }

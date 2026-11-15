@@ -7,9 +7,20 @@ filegroup(
     srcs = [
         "attention.zig",
         "cute.zig",
+        "sparse_attention.zig",
         "//zml/kernels/paged_attention/cute/sm10x",
         "//zml/kernels/paged_attention/cute/sm120",
     ],
+)
+
+zig_test(
+    name = "reference_test",
+    srcs = [
+        "cases.zig",
+        "fixtures.zig",
+    ],
+    main = "reference.zig",
+    deps = ["//zml"],
 )
 
 zig_test(
@@ -36,6 +47,7 @@ zig_binary(
     srcs = [
         "cases.zig",
         "fixtures.zig",
+        "reference.zig",
     ],
     main = "benchmark.zig",
     tags = ["manual"],

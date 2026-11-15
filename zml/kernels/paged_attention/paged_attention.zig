@@ -10,7 +10,7 @@ const metal = @import("metal/metal.zig");
 const tpu = @import("mosaic_tpu/mosaic_tpu.zig");
 const stablehlo = @import("stablehlo/stablehlo.zig");
 pub const tcl = @import("tcl/tcl.zig");
-const triton = @import("triton/triton.zig");
+pub const triton = @import("triton/triton.zig");
 
 const PagedAttention = @This();
 
